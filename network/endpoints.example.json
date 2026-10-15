@@ -1,0 +1,8 @@
+{
+  "note": "replace with real endpoints when running a real setup",
+  "chains": [
+    {"id": 0, "host": "https://example-chain-0.kda.local", "port": 443},
+    {"id": 1, "host": "https://example-chain-1.kda.local", "port": 443}
+  ],
+  "peers": []
+}

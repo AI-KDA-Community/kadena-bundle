@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# ============================================================================
+# kda — Kadena ecosystem helper (bundled with every KDA-Community release)
+# ============================================================================
+# Self-contained. Depends only on: bash, openssl, tar, gzip, git (optional).
+# Commands:
+#   kda info                what this bundle is + disambiguation
+#   kda version             bundle version
+#   kda doctor              check the local environment
+#   kda secrets init        create a project config
+#   kda secrets set K V     set a key/value
+#   kda secrets get K       read a key
+#   kda secrets list        list keys
+#   kda secrets render      write .env from the config
+#   kda secrets edit        edit the raw TOML
+#   kda vault encrypt <dir> encrypt a folder to the local vault
+#   kda vault list          list encrypted archives
+#   kda vault decrypt <f>   decrypt one archive
+#   kda help
+# ============================================================================
+set -uo pipefail
+
+BUNDLE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VERSION_FILE="${BUNDLE_ROOT}/VERSION"
+VERSION="$(cat "$VERSION_FILE" 2>/dev/null || echo unknown)"
+
+c_reset=$'\033[0m'; c_bold=$'\033[1m'; c_dim=$'\033[2m'
+c_green=$'\033[32m'; c_red=$'\033[31m'; c_yellow=$'\033[33m'; c_cyan=$'\033[36m'
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$c_green" "$c_reset" "$*"; }
+warn() { printf '  %s!%s %s\n' "$c_yellow" "$c_reset" "$*"; }
+err()  { printf '  %s✗%s %s\n' "$c_red" "$c_reset" "$*" >&2; }
+hdr()  { printf '\n%s%s── %s ──%s\n' "$c_bold" "$c_cyan" "$*" "$c_reset"; }
+
+CONF_DIR="${HOME}/.config/kda-bundle"
+VAULT_DIR="${HOME}/kda-bundle/secrets-vault"
+VAULT_KEY="${CONF_DIR}/vault.key"
+CREDS_CONF="${CONF_DIR}/creds.toml"
+
+ensure_dirs() {
+  mkdir -p "$CONF_DIR" "$VAULT_DIR"
+  chmod 700 "$CONF_DIR" "$VAULT_DIR"
+}
+
+ensure_key() {
+  ensure_dirs
+  if [[ ! -f "$VAULT_KEY" ]]; then
+    openssl rand -base64 48 > "$VAULT_KEY"
+    chmod 600 "$VAULT_KEY"
+    ok "created vault key at $VAULT_KEY (back it up!)"
+  fi
+}
+
+# ---- info -------------------------------------------------------------------
+cmd_info() {
+  hdr "@kadena bundle v${VERSION}"
+  cat "${BUNDLE_ROOT}/README.md" 2>/dev/null || say "(README missing)"
+  say ""
+  say "  Bundle location: $BUNDLE_ROOT"
+  say "  Run 'kda doctor' to verify your local setup."
+}
+
+# ---- version ----------------------------------------------------------------
+cmd_version() { echo "$VERSION"; }
+
+# ---- doctor -----------------------------------------------------------------
+cmd_doctor() {
+  hdr "Environment check"
+  local issues=0
+  for tool in bash openssl tar gzip; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      ok "$tool"
+    else
+      err "$tool missing"
+      issues=$((issues+1))
+    fi
+  done
+  # optional
+  for tool in git jq; do
+    command -v "$tool" >/dev/null 2>&1 && ok "$tool (optional)" || warn "$tool (optional) missing"
+  done
+  say ""
+  if [[ ! -f "$CREDS_CONF" ]]; then
+    warn "no creds config yet — run: kda secrets init"
+  else
+    ok "creds config: $CREDS_CONF"
+  fi
+  if [[ ! -f "$VAULT_KEY" ]]; then
+    warn "no vault key yet — run: kda vault encrypt to create one"
+  else
+    ok "vault key: $VAULT_KEY"
+  fi
+  say ""
+  (( issues == 0 )) && ok "all required tools present" || err "$issues missing tool(s)"
+}
+
+# ---- secrets sub-commands ---------------------------------------------------
+creds_init_conf() {
+  ensure_dirs
+  [[ -f "$CREDS_CONF" ]] && return
+  cat > "$CREDS_CONF" <<'EOF'
+# kda-bundle credentials manager
+# [projects.<name>]
+# env_file = "~/.config/<name>/.env"
+# [projects.<name>.values]
+# KEY = "value"
+EOF
+  chmod 600 "$CREDS_CONF"
+}
+
+secrets_init() {
+  local proj="${1:-}"
+  if [[ -z "$proj" ]]; then
+    read -rp "  project name: " proj
+  fi
+  [[ -z "$proj" ]] && { err "project name required"; return 1; }
+  creds_init_conf
+  if grep -q "^\[projects\.${proj}\]" "$CREDS_CONF"; then
+    warn "project '$proj' already exists"; return
+  fi
+  local def="~/.config/${proj}/.env"
+  read -rp "  env_file path [$def]: " p
+  p="${p:-$def}"
+  {
+    printf '\n[projects.%s]\n' "$proj"
+    printf 'env_file = "%s"\n' "$p"
+  } >> "$CREDS_CONF"
+  ok "created '$proj' → env_file = $p"
+}
+
+secrets_set() {
+  local proj="${1:-}" key="${2:-}" val="${3:-}"
+  [[ -z "$proj" || -z "$key" ]] && { err "usage: kda secrets set <project> <KEY> [value]"; return 1; }
+  creds_init_conf
+  if ! grep -q "^\[projects\.${proj}\]" "$CREDS_CONF"; then
+    err "no project '$proj' — run: kda secrets init $proj"; return 1
+  fi
+  if [[ -z "$val" ]]; then
+    read -rsp "  value for $key: " val; echo
+  fi
+  val="${val//\\/\\\\}"; val="${val//\"/\\\"}"
+  if ! grep -q "^\[projects\.${proj}\.values\]" "$CREDS_CONF"; then
+    printf '\n[projects.%s.values]\n' "$proj" >> "$CREDS_CONF"
+  fi
+  awk -v p="$proj" -v k="$key" -v v="$val" '
+    $0 == "[projects."p".values]" {print; found=1; print k" = \""v"\""; next}
+    {print}
+    END {exit !found}' "$CREDS_CONF" > "$CREDS_CONF.tmp" \
+    && mv "$CREDS_CONF.tmp" "$CREDS_CONF"
+  # If we just created the [values] header AND printed the pair, we now
+  # have the key duplicated next to the header. Dedup:
+  awk '!seen[$0]++ || $0 !~ /^[A-Za-z_]/' "$CREDS_CONF" > "$CREDS_CONF.tmp" \
+    && mv "$CREDS_CONF.tmp" "$CREDS_CONF"
+  chmod 600 "$CREDS_CONF"
+  ok "set $proj.$key"
+}
+
+secrets_get() {
+  local proj="${1:-}" key="${2:-}"
+  [[ -z "$proj" || -z "$key" ]] && { err "usage: kda secrets get <project> <KEY>"; return 1; }
+  awk -v p="$proj" -v k="$key" '
+    $0 == "[projects."p".values]" {insec=1; next}
+    /^\[/ {insec=0}
+    insec && $0 ~ "^"k"[[:space:]]*=" {
+      sub(/^[^=]*=[[:space:]]*/, ""); gsub(/^"|"$/, ""); print; exit
+    }' "$CREDS_CONF"
+}
+
+secrets_list() {
+  local proj="${1:-}"
+  creds_init_conf
+  if [[ -z "$proj" ]]; then
+    say "Projects:"
+    awk -F'[][]' '/^\[projects\.[^.]+\]$/ {print "  -", $2}' "$CREDS_CONF" | sed 's/projects\.//'
+  else
+    say "Keys in $proj:"
+    awk -v p="$proj" '
+      $0 == "[projects."p".values]" {insec=1; next}
+      /^\[/ {insec=0}
+      insec && /^[A-Za-z_]/ {sub(/[[:space:]]*=.*/, ""); print "  - "$0}' "$CREDS_CONF"
+  fi
+}
+
+secrets_render() {
+  local proj="${1:-}"
+  [[ -z "$proj" ]] && { err "usage: kda secrets render <project>"; return 1; }
+  local env_path
+  env_path=$(awk -v p="$proj" '
+    $0 == "[projects."p"]" {insec=1; next}
+    /^\[/ {insec=0}
+    insec && /^env_file[[:space:]]*=/ {
+      sub(/^[^=]*=[[:space:]]*/, ""); gsub(/^"|"$/, ""); print; exit
+    }' "$CREDS_CONF")
+  [[ -z "$env_path" ]] && { err "no env_file for '$proj'"; return 1; }
+  eval env_path="$env_path"
+  mkdir -p "$(dirname "$env_path")"
+  awk -v p="$proj" '
+    $0 == "[projects."p".values]" {insec=1; next}
+    /^\[/ {insec=0}
+    insec && /^[A-Za-z_]/ {
+      key=$0; sub(/[[:space:]]*=.*/, "", key)
+      val=$0; sub(/^[^=]*=[[:space:]]*/, "", val)
+      gsub(/^"|"$/, "", val)
+      print key "=" val
+    }' "$CREDS_CONF" > "$env_path"
+  chmod 600 "$env_path"
+  ok "wrote $env_path ($(wc -l < "$env_path") entries)"
+}
+
+secrets_edit() {
+  creds_init_conf
+  "${EDITOR:-vi}" "$CREDS_CONF"
+}
+
+# ---- vault ------------------------------------------------------------------
+vault_encrypt() {
+  local src="${1:-.}"
+  [[ ! -d "$src" ]] && { err "not a directory: $src"; return 1; }
+  ensure_key
+  local name
+  read -rp "  archive name [$(basename "$src")-$(date -u +%Y%m%dT%H%M%SZ)]: " name
+  name="${name:-$(basename "$src")-$(date -u +%Y%m%dT%H%M%SZ)}"
+  local tar="${VAULT_DIR}/${name}.tar.gz"
+  local enc="${tar}.enc"
+  ( cd "$src" && tar -czf "$tar" . ) || { err "tar failed"; return 1; }
+  openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 \
+    -in "$tar" -out "$enc" -pass file:"$VAULT_KEY" 2>/dev/null \
+    || { err "encrypt failed"; rm -f "$tar"; return 1; }
+  shred -u "$tar" 2>/dev/null || rm -f "$tar"
+  chmod 600 "$enc"
+  ok "encrypted → $enc"
+}
+
+vault_list() {
+  ensure_dirs
+  if compgen -G "$VAULT_DIR/*.enc" > /dev/null; then
+    for f in "$VAULT_DIR"/*.enc; do
+      printf '  %s  (%s)\n' "$f" "$(du -h "$f" | cut -f1)"
+    done
+  else
+    warn "no archives in $VAULT_DIR"
+  fi
+}
+
+vault_decrypt() {
+  local enc="${1:-}"
+  [[ -f "$enc" ]] || { err "file not found: $enc"; return 1; }
+  ensure_key
+  local out
+  read -rp "  output tar path [${enc%.enc}]: " out
+  out="${out:-${enc%.enc}}"
+  openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
+    -in "$enc" -out "$out" -pass file:"$VAULT_KEY" 2>/dev/null \
+    || { err "decrypt failed"; return 1; }
+  ok "decrypted → $out"
+  say "  extract with: tar -xzf '$out'"
+}
+
+# ---- help -------------------------------------------------------------------
+cmd_help() {
+  hdr "kda — Kadena bundle helper"
+  sed -n '3,20p' "${BASH_SOURCE[0]}" | sed 's/^# //; s/^#//'
+}
+
+# ---- dispatch ---------------------------------------------------------------
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  info)     cmd_info ;;
+  version)  cmd_version ;;
+  doctor)   cmd_doctor ;;
+  secrets)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      init)   secrets_init   "$@" ;;
+      set)    secrets_set    "$@" ;;
+      get)    secrets_get    "$@" ;;
+      list)   secrets_list   "$@" ;;
+      render) secrets_render "$@" ;;
+      edit)   secrets_edit   "$@" ;;
+      *) err "unknown secrets sub-command: $sub"; cmd_help; exit 2 ;;
+    esac
+    ;;
+  vault)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      encrypt) vault_encrypt "$@" ;;
+      list)    vault_list ;;
+      decrypt) vault_decrypt "$@" ;;
+      *) err "unknown vault sub-command: $sub"; cmd_help; exit 2 ;;
+    esac
+    ;;
+  help|-h|--help) cmd_help ;;
+  *) err "unknown command: $cmd"; cmd_help; exit 2 ;;
+esac
